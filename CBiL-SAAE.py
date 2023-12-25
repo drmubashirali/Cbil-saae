@@ -74,7 +74,7 @@ def clarke_error_grid_regions_percentage(reference, prediction):
     return regions_percentage
     
 segments = [seg for seg in segments if len(seg) == fifteen_seconds_data_points]
-X = np.array(segments).reshape(-1, 1, fifteen_seconds_data_points)
+X = np.array(segments).reshape(-idx, idx, fifteen_seconds_data_points)
 y = np.array(mapped_glucose_values)[:len(segments)]
 
 train_days = 100
@@ -86,10 +86,7 @@ X_test = torch.tensor(X[train_indices:], dtype=torch.float32)
 y_test = torch.tensor(y[train_indices:], dtype=torch.float32)
 
 train_dataset = TensorDataset(X_train, y_train)
-val_dataset = TensorDataset(X_test, y_test)
-
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=32)
 
 device = torch.device("cuda:1")
 
@@ -171,62 +168,121 @@ class EnhancedGlucoseModel(nn.Module):
 
 model = EnhancedGlucoseModel().to(device)
 
+# Define loss function and optimizer
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=5e-3)
 
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5000, gamma=0.92)
-
+# Training loop
 num_epochs = 50
-best_val_loss = float('inf')
-early_stop_patience = 15
-no_improve_epochs = 0
-
 for epoch in tqdm(range(num_epochs), desc="Training Epochs"):
     model.train()
-    train_loss = 0  
+    train_loss = 0
     for batch_x, batch_y in tqdm(train_loader, desc="Training Batches", leave=False):
-        batch_x, batch_y = batch_x.to(device), batch_y.to(device)  
-        optimizer.zero_grad()        
+        batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+        optimizer.zero_grad()
         outputs = model(batch_x)
-        loss = criterion(outputs, batch_y.unsqueeze(1))        
+        loss = criterion(outputs, batch_y.unsqueeze(1))
         loss.backward()
         optimizer.step()
-        scheduler.step()        
         train_loss += loss.item()
-        
-    avg_train_loss = train_loss / len(train_loader)
-      
-    model.eval()
-    val_loss = 0
-    with torch.no_grad():
-        for batch_x, batch_y in val_loader:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-            outputs = model(batch_x)
-            loss = criterion(outputs, batch_y.unsqueeze(1))
-            val_loss += loss.item()
-    
-    avg_val_loss = val_loss / len(val_loader)
-    print(f'Epoch [{epoch+1}/{num_epochs}], Validation Loss: {avg_val_loss:.4f}')
-        
-    if avg_val_loss < best_val_loss:
-        best_val_loss = avg_val_loss
-        no_improve_epochs = 0
-        torch.save(model.state_dict(), 'best_model_csa.pth')
-    else:
-        no_improve_epochs += 1
-        if no_improve_epochs == early_stop_patience:
-            print("Early stopping...")
-            model.load_state_dict(torch.load('best_model_csa.pth'))
-            break
 
-model.eval()
-y_pred = [] 
-with torch.no_grad():
-    for batch_x, _ in tqdm(val_loader, desc="Predicting"):
-        batch_x = batch_x.to(device)  
-        outputs = model(batch_x)
-        y_pred.extend(outputs.cpu().squeeze().tolist()) 
+    avg_train_loss = train_loss / len(train_loader)
+    print(f'Epoch [{epoch+1}/{num_epochs}], Training Loss: {avg_train_loss:.4f}')
+
+# Save the model
+torch.save(model.state_dict(), 'glucose_model.pth')
+
+
+#Validation
+val_dataset = TensorDataset(X_test, y_test)
+val_loader = DataLoader(val_dataset, batch_size=32)
+device = torch.device("cuda:1")
+class DeepSpatialAttention(nn.Module):
+    def __init__(self, input_dim):
+        super(DeepSpatialAttention, self).__init__()
+       
+        self.query = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2),
+            nn.ReLU(),
+            nn.Linear(input_dim // 2, input_dim // 4),
+            nn.ReLU(),
+            nn.Linear(input_dim // 4, input_dim)
+        )
+        self.key = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2),
+            nn.ReLU(),
+            nn.Linear(input_dim // 2, input_dim // 4),
+            nn.ReLU(),
+            nn.Linear(input_dim // 4, input_dim)
+        )
         
+    def forward(self, x):
+        
+        q = self.query(x) 
+        k = self.key(x)   
+        
+        attn_weights = torch.softmax(torch.bmm(q, k.transpose(1, 2)), dim=-1)
+        attn_output = torch.bmm(attn_weights, x)
+        
+        return attn_output, attn_weights
+
+class ComplexLSTMEncoder(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers):
+        super(ComplexLSTMEncoder, self).__init__()
+        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, 
+                            num_layers=num_layers, batch_first=True, dropout=0.5, 
+                            bidirectional=True)
+        self.hidden_size = hidden_size
+
+    def forward(self, x):
+        x, _ = self.lstm(x)
+        return x
+
+class ComplexLSTMDecoder(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(ComplexLSTMDecoder, self).__init__()
+        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, 
+                            num_layers=1, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+        
+    def forward(self, x):
+        x, _ = self.lstm(x)
+        x = self.fc(x[ :, -1, :]) 
+        return x
+
+class EnhancedGlucoseModel(nn.Module):
+    def __init__(self):
+        super(EnhancedGlucoseModel, self).__init__()
+
+    
+        self.encoder_lstm1 = ComplexLSTMEncoder(15000, 256, 16)
+        self.encoder_lstm2 = ComplexLSTMEncoder(512, 128, 8)
+        self.encoder_lstm3 = ComplexLSTMEncoder(256, 64, 2)
+   
+        self.deep_spatial_attention = DeepSpatialAttention(128)
+   
+        self.decoder_lstm = ComplexLSTMDecoder(128, 64, 1)
+        self.fc = nn.Linear(64, 1)
+
+    def forward(self, x):
+        x = self.encoder_lstm1(x)
+        x = self.encoder_lstm2(x)
+        x, attn_weights = self.deep_spatial_attention(x)
+        x = self.encoder_lstm3(x)
+        x = self.decoder_lstm(x)
+        x = self.fc(x)
+        return x
+
+model = EnhancedGlucoseModel().to(device)
+model.load_state_dict(torch.load('glucose_model.pth'))
+model.eval()
+
+y_pred = []
+with torch.no_grad():
+    for batch_x, batch_y in tqdm(val_loader, desc="Validating"):
+        batch_x = batch_x.to(device)
+        outputs = model(batch_x)
+        y_pred.extend(outputs.cpu().squeeze().tolist())
 
 y_test_np = y_test.numpy()
 y_pred_np = np.array(y_pred)
@@ -237,15 +293,16 @@ mard = np.mean(np.abs((y_test_np - y_pred_np) / y_test_np)) * 100
 print(f"RMSE: {rmse:.2f}")
 print(f"MARD: {mard:.2f}%")
 
+# Clarke Error Grid Analysis (assuming the function is defined)
 regions_percentage = clarke_error_grid_regions_percentage(y_test_np, y_pred_np)
 print(f"Clarke Error Grid Analysis:")
 for region, percentage in regions_percentage.items():
-    print(f"Region {region}: {percentage:.2f}%")
-    
+    print(f"Region {region}: {percentage:.2f}%")    
+
+
 #10-folds
-# Reshape and filter
 segments = [seg for seg in segments if len(seg) == fifteen_seconds_data_points]
-X = np.array(segments).reshape(-1, 1, fifteen_seconds_data_points)
+X = np.array(segments).reshape(-idx, idx, fifteen_seconds_data_points)
 y = np.array(mapped_glucose_values)[:len(segments)]
 
 # KFold cross-validation
@@ -298,17 +355,14 @@ for fold, (train_index, val_index) in enumerate(kf.split(X)):
                 nn.Linear(input_dim // 4, input_dim)
             )
 
-        def forward(self, x):
-            batch_size, seq_len, _ = x.size()
-
-            x_reshaped = x.contiguous().view(-1, x.size(-1))
-
-            q = self.query(x_reshaped).view(batch_size, seq_len, -1)
-            k = self.key(x_reshaped).view(batch_size, seq_len, -1)
-
+       def forward(self, x):
+        
+            q = self.query(x) 
+            k = self.key(x)   
+        
             attn_weights = torch.softmax(torch.bmm(q, k.transpose(1, 2)), dim=-1)
             attn_output = torch.bmm(attn_weights, x)
-
+        
             return attn_output, attn_weights
 
     class ComplexLSTMEncoder(nn.Module):
