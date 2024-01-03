@@ -12,20 +12,25 @@ from sklearn.model_selection import KFold
 from collections import defaultdict
 
 df_glucose = pd.read_excel('Reference_BG.xlsx', skiprows=1, header=None)
+
 directory_path = './'
 
 fs = 1000
 fifteen_seconds_data_points = 15 * fs
 five_minutes_data_points = 5 * 60 * fs
+idx = 1
 segments = []
 mapped_glucose_values = []
 
 mat_files = sorted([f for f in os.listdir(directory_path) if f.endswith('.mat')])
+
 excel_days = df_glucose.iloc[0].astype(int).astype(str).values
+
 segments_per_day = []
+
 for mat_file in tqdm(mat_files, desc="Processing MAT files"):
     day_name = mat_file.split('.')[0]
-    day_segments = 0  
+    day_segments = 0  # Counter for the current day's segments
 
     if day_name in excel_days:
         col_index = df_glucose.columns[excel_days == day_name].to_list()[0]
@@ -72,19 +77,21 @@ def clarke_error_grid_regions_percentage(reference, prediction):
 
     regions_percentage = {region: (count / total_points) * 100 for region, count in regions_count.items()}
     return regions_percentage
-    
+   
 segments = [seg for seg in segments if len(seg) == fifteen_seconds_data_points]
 X = np.array(segments).reshape(-idx, idx, fifteen_seconds_data_points)
 y = np.array(mapped_glucose_values)[:len(segments)]
 
+# Day-wise split
 train_days = 100
 train_indices = sum(segments_per_day[:train_days])
 
 X_train = torch.tensor(X[:train_indices], dtype=torch.float32)
 y_train = torch.tensor(y[:train_indices], dtype=torch.float32)
-X_test = torch.tensor(X[train_indices:], dtype=torch.float32)  
+X_test = torch.tensor(X[train_indices:], dtype=torch.float32)  # renamed to X_test for consistency
 y_test = torch.tensor(y[train_indices:], dtype=torch.float32)
 
+# Create DataLoaders
 train_dataset = TensorDataset(X_train, y_train)
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 
@@ -93,7 +100,7 @@ device = torch.device("cuda:1")
 class DeepSpatialAttention(nn.Module):
     def __init__(self, input_dim):
         super(DeepSpatialAttention, self).__init__()
-       
+        # Adding more transformations for the query and key generation
         self.query = nn.Sequential(
             nn.Linear(input_dim, input_dim // 2),
             nn.ReLU(),
@@ -110,10 +117,9 @@ class DeepSpatialAttention(nn.Module):
         )
         
     def forward(self, x):
-        
-        q = self.query(x) 
-        k = self.key(x)   
-        
+        q = self.query(x)  
+        k = self.key(x)    
+
         attn_weights = torch.softmax(torch.bmm(q, k.transpose(1, 2)), dim=-1)
         attn_output = torch.bmm(attn_weights, x)
         
@@ -122,6 +128,7 @@ class DeepSpatialAttention(nn.Module):
 class ComplexLSTMEncoder(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers):
         super(ComplexLSTMEncoder, self).__init__()
+        
         self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, 
                             num_layers=num_layers, batch_first=True, dropout=0.5, 
                             bidirectional=True)
@@ -134,26 +141,27 @@ class ComplexLSTMEncoder(nn.Module):
 class ComplexLSTMDecoder(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
         super(ComplexLSTMDecoder, self).__init__()
+        
         self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, 
                             num_layers=1, batch_first=True)
         self.fc = nn.Linear(hidden_size, output_size)
-        
+
     def forward(self, x):
         x, _ = self.lstm(x)
-        x = self.fc(x[ :, -1, :]) 
+        x = x[:, -1, :]  # Selecting the last timestep
+        x = self.fc(x)
         return x
 
 class EnhancedGlucoseModel(nn.Module):
     def __init__(self):
         super(EnhancedGlucoseModel, self).__init__()
 
-    
-        self.encoder_lstm1 = ComplexLSTMEncoder(15000, 256, 16)
+        self.encoder_lstm1 = ComplexLSTMEncoder(15000, 256,16)
         self.encoder_lstm2 = ComplexLSTMEncoder(512, 128, 8)
         self.encoder_lstm3 = ComplexLSTMEncoder(256, 64, 2)
-   
-        self.deep_spatial_attention = DeepSpatialAttention(128)
-   
+        
+        self.deep_spatial_attention = DeepSpatialAttention(128*2)
+        
         self.decoder_lstm = ComplexLSTMDecoder(128, 64, 1)
         self.fc = nn.Linear(64, 1)
 
@@ -163,7 +171,6 @@ class EnhancedGlucoseModel(nn.Module):
         x, attn_weights = self.deep_spatial_attention(x)
         x = self.encoder_lstm3(x)
         x = self.decoder_lstm(x)
-        x = self.fc(x)
         return x
 
 model = EnhancedGlucoseModel().to(device)
@@ -171,6 +178,9 @@ model = EnhancedGlucoseModel().to(device)
 # Define loss function and optimizer
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=5e-3)
+
+# Define learning rate scheduler
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5000, gamma=0.92)
 
 # Training loop
 num_epochs = 50
@@ -189,94 +199,10 @@ for epoch in tqdm(range(num_epochs), desc="Training Epochs"):
     avg_train_loss = train_loss / len(train_loader)
     print(f'Epoch [{epoch+1}/{num_epochs}], Training Loss: {avg_train_loss:.4f}')
 
-# Save the model
-torch.save(model.state_dict(), 'glucose_model.pth')
-
-
-#Validation
 val_dataset = TensorDataset(X_test, y_test)
 val_loader = DataLoader(val_dataset, batch_size=32)
-device = torch.device("cuda:1")
-class DeepSpatialAttention(nn.Module):
-    def __init__(self, input_dim):
-        super(DeepSpatialAttention, self).__init__()
-       
-        self.query = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 2),
-            nn.ReLU(),
-            nn.Linear(input_dim // 2, input_dim // 4),
-            nn.ReLU(),
-            nn.Linear(input_dim // 4, input_dim)
-        )
-        self.key = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 2),
-            nn.ReLU(),
-            nn.Linear(input_dim // 2, input_dim // 4),
-            nn.ReLU(),
-            nn.Linear(input_dim // 4, input_dim)
-        )
-        
-    def forward(self, x):
-        
-        q = self.query(x) 
-        k = self.key(x)   
-        
-        attn_weights = torch.softmax(torch.bmm(q, k.transpose(1, 2)), dim=-1)
-        attn_output = torch.bmm(attn_weights, x)
-        
-        return attn_output, attn_weights
 
-class ComplexLSTMEncoder(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers):
-        super(ComplexLSTMEncoder, self).__init__()
-        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, 
-                            num_layers=num_layers, batch_first=True, dropout=0.5, 
-                            bidirectional=True)
-        self.hidden_size = hidden_size
-
-    def forward(self, x):
-        x, _ = self.lstm(x)
-        return x
-
-class ComplexLSTMDecoder(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super(ComplexLSTMDecoder, self).__init__()
-        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, 
-                            num_layers=1, batch_first=True)
-        self.fc = nn.Linear(hidden_size, output_size)
-        
-    def forward(self, x):
-        x, _ = self.lstm(x)
-        x = self.fc(x[ :, -1, :]) 
-        return x
-
-class EnhancedGlucoseModel(nn.Module):
-    def __init__(self):
-        super(EnhancedGlucoseModel, self).__init__()
-
-    
-        self.encoder_lstm1 = ComplexLSTMEncoder(15000, 256, 16)
-        self.encoder_lstm2 = ComplexLSTMEncoder(512, 128, 8)
-        self.encoder_lstm3 = ComplexLSTMEncoder(256, 64, 2)
-   
-        self.deep_spatial_attention = DeepSpatialAttention(128)
-   
-        self.decoder_lstm = ComplexLSTMDecoder(128, 64, 1)
-        self.fc = nn.Linear(64, 1)
-
-    def forward(self, x):
-        x = self.encoder_lstm1(x)
-        x = self.encoder_lstm2(x)
-        x, attn_weights = self.deep_spatial_attention(x)
-        x = self.encoder_lstm3(x)
-        x = self.decoder_lstm(x)
-        x = self.fc(x)
-        return x
-
-model = EnhancedGlucoseModel().to(device)
-model.load_state_dict(torch.load('glucose_model.pth'))
 model.eval()
-
 y_pred = []
 with torch.no_grad():
     for batch_x, batch_y in tqdm(val_loader, desc="Validating"):
@@ -287,17 +213,16 @@ with torch.no_grad():
 y_test_np = y_test.numpy()
 y_pred_np = np.array(y_pred)
 
-rmse = np.sqrt(mean_squared_error(y_test_np, y_pred_np))
+rmse = np.sqrt(mean_squared_error(y_test_np, y_pred_np)) 
 mard = np.mean(np.abs((y_test_np - y_pred_np) / y_test_np)) * 100
 
 print(f"RMSE: {rmse:.2f}")
 print(f"MARD: {mard:.2f}%")
 
-# Clarke Error Grid Analysis (assuming the function is defined)
 regions_percentage = clarke_error_grid_regions_percentage(y_test_np, y_pred_np)
 print(f"Clarke Error Grid Analysis:")
 for region, percentage in regions_percentage.items():
-    print(f"Region {region}: {percentage:.2f}%")    
+    print(f"Region {region}: {percentage:.2f}%") 
 
 
 #10-folds
